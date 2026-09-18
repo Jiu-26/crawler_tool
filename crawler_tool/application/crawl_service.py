@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time as time_module
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,10 +13,33 @@ from crawler_tool.pagination import (
     request_fingerprint,
 )
 from crawler_tool.application.recent_store import RecentItemsStore
+from crawler_tool.application.time_enrichment import TimeEnrichmentService
 from crawler_tool.domain import ContentSearchRequest, ContentSearchResponse, SourceReport, SourceStatus
 from crawler_tool.normalization.content_normalizer import normalize_raw_item
 from crawler_tool.sources.base import SourceAdapter
 from crawler_tool.sources.registry import SourceRegistry
+
+
+def _balanced_truncate(items: list, limit: int) -> list:
+    """多来源均衡截断：超过限额时按平台轮转选取，而不是顺序截断。
+
+    顺序截断会让先处理的平台占满全部限额、把后续来源（如手动捕获平台）
+    完全挤出具外——统一搜索的语义是"各来源都要有 representation"。
+    每个平台内部保持原有顺序，平台间按首次出现顺序轮转。
+    """
+    if len(items) <= limit:
+        return items
+    by_platform: dict[str, deque] = {}
+    for item in items:
+        by_platform.setdefault(item.platform, deque()).append(item)
+    balanced: list = []
+    while len(balanced) < limit and any(by_platform.values()):
+        for queue in by_platform.values():
+            if queue:
+                balanced.append(queue.popleft())
+                if len(balanced) >= limit:
+                    break
+    return balanced
 
 
 @dataclass
@@ -64,6 +88,7 @@ class CrawlService:
         cache_ttl_seconds: float | None = 600.0,
         clock: Any = None,
         history: RecentItemsStore | None = None,
+        time_enrichment: TimeEnrichmentService | None = None,
     ):
         self.registry = registry
         self.cache = cache or InMemoryContentCache()
@@ -74,6 +99,10 @@ class CrawlService:
         self._clock = clock if clock is not None else time_module.time
         # Shared session view: every successfully normalized item lands here.
         self.recent_store = history if history is not None else RecentItemsStore()
+        # 详情页时间补全仅在请求显式 enrichTime 时发请求；默认跳过手动捕获来源。
+        self.time_enrichment = time_enrichment or TimeEnrichmentService(
+            registry, skip_platforms=set(_LOCAL_HISTORY_PLATFORMS)
+        )
 
     def _cache_entry_fresh(self, entry: CachedPage) -> bool:
         if self.cache_ttl_seconds is None or entry.cached_at is None:
@@ -113,6 +142,17 @@ class CrawlService:
             continuation=continuation,
             adapter_version=adapter_version,
         )
+
+    def _upgrade_from_store(self, item):
+        """同一 content_id 的库存条目若带全文而实时结果只有摘要，用库存版本替换。"""
+        stored = self.recent_store.get(item.content_id)
+        if stored is None or stored.content_id != item.content_id:
+            return item
+        stored_full = bool(getattr(getattr(stored, "quality", None), "has_full_content", False))
+        live_full = bool(getattr(getattr(item, "quality", None), "has_full_content", False))
+        if stored_full and not live_full:
+            return stored
+        return item
 
     def search(self, request: ContentSearchRequest) -> ContentSearchResponse:
         request_id = f"req_{id(request):x}"
@@ -262,12 +302,20 @@ class CrawlService:
             finally:
                 if adapter is not None:
                     adapter.close()
+        # 会话库升级：同一 content_id 的库存条目若已有全文（如浏览器自动化回填），
+        # 用它替换实时摘要条目，让补抓内容进入证据流；无库存副本时原样返回。
+        items = [self._upgrade_from_store(item) for item in items]
+        # 详情页补全（时间/正文）：只作用于本次响应（截断后）的条目，失败不进 SourceReport。
+        final_items = _balanced_truncate(items, request.limit)
+        if (request.enrich_time or request.enrich_content) and final_items:
+            final_items, _ = self.time_enrichment.enrich(final_items, include_content=request.enrich_content)
+            self.recent_store.add(final_items)
         failed = any(report.status not in {SourceStatus.SUCCESS.value, SourceStatus.EMPTY.value} for report in reports)
         return ContentSearchResponse(
             request_id=request_id,
             status="partial" if failed and items else ("failed" if failed and not items else "success"),
             partial=failed,
-            items=items[: request.limit],
+            items=final_items,
             source_reports=reports,
             next_cursor=next_cursor,
         )

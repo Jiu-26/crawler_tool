@@ -35,9 +35,12 @@ class TriggerReport:
     due: int
     dispatched: int
     skipped_reason: str | None = None
+    failed: int = 0
+    partial: int = 0
 
     def to_payload(self) -> dict[str, Any]:
-        return {"due": self.due, "dispatched": self.dispatched, "skippedReason": self.skipped_reason}
+        return {"due": self.due, "dispatched": self.dispatched, "skippedReason": self.skipped_reason,
+                "failed": self.failed, "partial": self.partial}
 
 
 class AgentTrigger:
@@ -71,12 +74,16 @@ class AgentTrigger:
             # 无执行器：只报告，不改告警状态（人工判读流程不受影响）。
             return TriggerReport(due=len(due), dispatched=0, skipped_reason="no_runner_configured")
         dispatched = 0
+        failed = partial = 0
         for alert in due:
-            if dispatched >= self.max_runs_per_day - self._runs_today(today):
-                return TriggerReport(due=len(due), dispatched=dispatched, skipped_reason="daily_cap_reached")
-            self._dispatch(alert, today)
+            if self._runs_today(today) >= self.max_runs_per_day:
+                return TriggerReport(due=len(due), dispatched=dispatched, skipped_reason="daily_cap_reached",
+                                     failed=failed, partial=partial)
+            payload = self._dispatch(alert, today)
+            failed += payload["executionStatus"] == "failed"
+            partial += payload["executionStatus"] == "partial"
             dispatched += 1
-        return TriggerReport(due=len(due), dispatched=dispatched)
+        return TriggerReport(due=len(due), dispatched=dispatched, failed=failed, partial=partial)
 
     # ---- 选件 ----
 
@@ -103,12 +110,27 @@ class AgentTrigger:
     def _dispatch(self, alert: dict[str, Any], today: str) -> dict[str, Any]:
         seed = alert_to_seed_event(alert)
         budget = {"maxRounds": self.max_rounds, "maxToolCalls": self.max_tool_calls}
-        result = self.runner.run(seed_event=seed, budget=budget)  # type: ignore[union-attr]
+        try:
+            result = self.runner.run(seed_event=seed, budget=budget)  # type: ignore[union-attr]
+            # 在写入前验证协议，日期等必须由 runner 转成 JSON 兼容字段。
+            if not isinstance(result, dict):
+                raise TypeError("DiscoveryRunner 必须返回字典")
+            json.dumps(result, ensure_ascii=False, allow_nan=False)
+        except Exception as exc:
+            # 失败也落盘并占用次数，避免下一轮无界重试或中断后续告警。
+            result = {"stopReason": "FAILED", "errors": [{
+                "stage": "runner", "errorType": type(exc).__name__,
+                "message": "发现循环执行失败；未保存原始异常内容",
+            }]}
+        stop_reason = result.get("stopReason", "COMPLETED")
+        execution_status = ("completed" if stop_reason == "COMPLETED" else
+                            "failed" if stop_reason == "FAILED" else "partial")
         payload = {
             "alertId": alert.get("alertId"),
             "seedEvent": seed,
             "budget": budget,
             "result": result,
+            "executionStatus": execution_status,
             "dispatchedAt": today,
         }
         (self.discoveries_dir / f"{alert.get('alertId')}.json").write_text(

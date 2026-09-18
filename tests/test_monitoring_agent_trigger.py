@@ -90,6 +90,46 @@ def test_without_runner_status_untouched_and_due_reported(tmp_path: Path):
     assert all(a["status"] == "pending" for a in tool.store.load_alerts())
 
 
+def test_daily_cap_allows_exact_remaining_slots(tmp_path: Path):
+    runner = RecordingRunner()
+    tool, trigger = setup_trigger(tmp_path, runner=runner, max_runs_per_day=2)
+    report = trigger.run_due_triggers(now=date(2026, 9, 7))
+    assert report.dispatched == 2
+    assert report.skipped_reason is None
+    assert tool.store.load_state()["agentRuns"]["2026-09-07"] == 2
+
+
+def test_failed_runner_is_saved_counted_and_does_not_abort_next_alert(tmp_path: Path):
+    class FlakyRunner(RecordingRunner):
+        def run(self, seed_event, budget):
+            result = super().run(seed_event, budget)
+            if len(self.calls) == 1:
+                raise RuntimeError("private-exception-detail")
+            return result
+
+    tool, trigger = setup_trigger(tmp_path, runner=FlakyRunner(), max_runs_per_day=2)
+    report = trigger.run_due_triggers(now=date(2026, 9, 7))
+    assert report.dispatched == 2 and report.failed == 1
+    assert tool.store.load_state()["agentRuns"]["2026-09-07"] == 2
+    files = list(trigger.discoveries_dir.glob("*.json"))
+    assert len(files) == 2
+    payloads = [json_load(path) for path in files]
+    assert {p["executionStatus"] for p in payloads} == {"completed", "failed"}
+    assert "private-exception-detail" not in str(payloads)
+    assert trigger.run_due_triggers(now=date(2026, 9, 7)).dispatched == 0
+
+
+def test_partial_workflow_result_is_not_reported_as_completed(tmp_path: Path):
+    class PartialRunner:
+        def run(self, seed_event, budget):
+            return {"stopReason": "MODEL_BUDGET_EXHAUSTED", "events": []}
+
+    tool, trigger = setup_trigger(tmp_path, runner=PartialRunner())
+    report = trigger.run_due_triggers(now=date(2026, 9, 7))
+    assert report.partial == 2 and report.failed == 0
+    assert all(json_load(p)["executionStatus"] == "partial" for p in trigger.discoveries_dir.glob("*.json"))
+
+
 def json_load(path: Path) -> dict:
     import json
 

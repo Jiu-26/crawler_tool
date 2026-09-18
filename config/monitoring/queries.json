@@ -2,18 +2,24 @@
   "queriesPerTick": 2,
   "platforms": [
     "south_weekend",
-    "toutiao",
-    "cctv_news",
-    "weibo",
-    "sogou_wechat"
+    "cctv_news"
   ],
   "includeCaptured": true,
   "queries": [
-    "华为",
-    "华为 Mate XT2",
-    "小米",
-    "小米18",
-    "折叠屏 手机",
-    "华为 小米"
+    "华为 盘古 开源",
+    "华为 昇腾 算力",
+    "DeepSeek V4",
+    "Kimi K3 开源",
+    "通义千问 发布",
+    "豆包大模型 更新",
+    "文心一言 升级",
+    "讯飞星火 发布",
+    "腾讯 混元 开源",
+    "智谱 GLM 发布",
+    "百川智能 融资",
+    "大模型 提价",
+    "AI 智能体 发布",
+    "大模型 开源 2026",
+    "人工智能 备案 监管"
   ]
 }
